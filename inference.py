@@ -41,6 +41,9 @@ def generate_text(
             # 获取模型输出
             outputs = model(input_ids)
             next_token_logits = outputs[:, -1, :] / temperature
+            # 确保logits维度正确
+            if next_token_logits.dim() == 1:
+                next_token_logits = next_token_logits.unsqueeze(0)
             
             # 应用Top-K和Top-P过滤
             filtered_logits = top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
@@ -167,7 +170,8 @@ def main():
             # 简单的编码：将字符转换为数字索引
             # 在实际应用中应该使用真实的tokenizer
             import random
-            tokens = [random.randint(0, config.vocab_size-1) for _ in range(10)]
+            # 确保token ID在词汇表范围内
+            tokens = [random.randint(0, config.vocab_size-2) for _ in range(10)]
             return torch.tensor([tokens])
             
         def decode(self, tokens, skip_special_tokens=False):
