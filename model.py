@@ -191,14 +191,13 @@ class TinyLLM(nn.Module):
         self,
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None
+        position_ids: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         batch_size, seq_length = input_ids.shape
         
         # 创建位置ID
         if position_ids is None:
-            position_ids_base = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
-            position_ids = position_ids_base.unsqueeze(0).repeat(batch_size, 1)
+            position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device).unsqueeze(0).repeat(batch_size, 1)
             
         # 创建注意力掩码
         if attention_mask is None:
