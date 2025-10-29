@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
-from model import TinyLLM
+from model import TinyLLM, KVCache
 from config import ModelConfig
 
 def generate_text(
@@ -12,7 +12,8 @@ def generate_text(
     temperature: float = 1.0,
     top_k: int = 50,
     top_p: float = 0.95,
-    device: torch.device = torch.device("cpu")
+    device: torch.device = torch.device("cpu"),
+    use_cache: bool = False  # 暂时禁用缓存
 ) -> str:
     """
     使用模型生成文本
@@ -26,11 +27,15 @@ def generate_text(
         top_k: Top-K采样参数
         top_p: Top-P采样参数
         device: 设备
+        use_cache: 是否使用KV缓存
         
     Returns:
         生成的文本
     """
     model.eval()
+    
+    # 初始化KV缓存
+    kv_cache = KVCache() if use_cache else None
     
     # 编码输入文本
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
@@ -39,7 +44,7 @@ def generate_text(
     with torch.no_grad():
         for _ in range(max_length):
             # 获取模型输出
-            outputs = model(input_ids)
+            outputs = model(input_ids, kv_cache=kv_cache, use_cache=use_cache)
             next_token_logits = outputs[:, -1, :] / temperature
             # 确保logits维度正确
             if next_token_logits.dim() == 1:
@@ -67,6 +72,10 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')
     """
     根据Top-K和Top-P参数过滤logits
     """
+    # 确保logits是二维的
+    if logits.dim() == 1:
+        logits = logits.unsqueeze(0)
+    
     # Top-K过滤
     if top_k > 0:
         top_k = min(top_k, logits.size(-1))  # 安全检查
@@ -86,8 +95,11 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')
         sorted_indices_to_remove[..., 0] = 0
 
         # 将索引移回原始顺序
-        indices_to_remove = sorted_indices[sorted_indices_to_remove]
-        logits[indices_to_remove] = filter_value
+        # 修复索引错误
+        batch_size, vocab_size = logits.shape
+        for i in range(batch_size):
+            indices_to_remove = sorted_indices[i][sorted_indices_to_remove[i]]
+            logits[i][indices_to_remove] = filter_value
         
     return logits
 

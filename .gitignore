@@ -146,3 +146,7 @@ data/
 datasets/
 *.jsonl
 *.parquet
+
+# 训练过程中生成的特定模型文件
+demo_model.pt
+tinyllm_final.pt

@@ -6,6 +6,7 @@ class ModelConfig:
         self.hidden_size = 768   # 隐藏层维度
         self.num_hidden_layers = 12  # Transformer层数
         self.num_attention_heads = 12  # 注意力头数
+        self.num_kv_heads = self.num_attention_heads  # GQA的KV头数，默认与查询头数相同
         self.intermediate_size = 3072  # 前馈网络中间维度
         self.max_position_embeddings = 2048  # 最大位置编码
         self.layer_norm_eps = 1e-5  # LayerNorm epsilon值
@@ -20,6 +21,10 @@ class ModelConfig:
         
         # 数据参数
         self.block_size = 512  # 序列长度
+        
+        # 推理优化参数
+        self.use_kv_cache = True  # 是否使用KV缓存
+        self.use_flash_attention = False  # 是否使用Flash Attention（如果可用）
         
         # 其他参数
         self.seed = 42

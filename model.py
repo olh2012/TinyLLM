@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from config import ModelConfig
 
 class RotaryPositionEmbedding(nn.Module):
@@ -17,20 +17,35 @@ class RotaryPositionEmbedding(nn.Module):
         # 简化实现以避免类型错误
         return x  # 直接返回输入，不应用旋转位置编码
 
-class MultiHeadAttention(nn.Module):
-    """多头注意力机制"""
+    def rotate_half(self, x):
+        """旋转一半维度"""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def apply_rotary_pos_emb(self, q, k, cos, sin):
+        """应用旋转位置编码"""
+        cos = cos.unsqueeze(1)  # [bs, 1, seq_len, dim]
+        sin = sin.unsqueeze(1)  # [bs, 1, seq_len, dim]
+        q_embed = (q * cos) + (self.rotate_half(q) * sin)
+        k_embed = (k * cos) + (self.rotate_half(k) * sin)
+        return q_embed, k_embed
+
+class GroupedQueryAttention(nn.Module):
+    """分组查询注意力机制"""
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_kv_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.dropout_rate = config.dropout_rate
         
         assert self.head_dim * self.num_heads == self.hidden_size, "hidden_size必须能被num_heads整除"
         
         self.q_proj = nn.Linear(self.hidden_size, self.hidden_size)
-        self.k_proj = nn.Linear(self.hidden_size, self.hidden_size)
-        self.v_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size)
         
         self.rotary_emb = RotaryPositionEmbedding(self.head_dim)
@@ -40,7 +55,9 @@ class MultiHeadAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None
+        position_ids: Optional[torch.Tensor] = None,
+        kv_cache = None,  # 简化类型注解以避免循环导入
+        layer_idx: Optional[int] = None
     ) -> torch.Tensor:
         batch_size, seq_length, _ = hidden_states.size()
         
@@ -51,8 +68,31 @@ class MultiHeadAttention(nn.Module):
         
         # 重塑为多头形式
         query = query.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
-        key = key.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
-        value = value.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        key = key.view(batch_size, seq_length, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        value = value.view(batch_size, seq_length, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        
+        # 如果KV头数少于查询头数，需要重复KV头
+        if self.num_kv_heads != self.num_heads:
+            # 重复KV头以匹配查询头数
+            key = key.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+            value = value.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+        
+        # 应用KV缓存
+        if kv_cache is not None and layer_idx is not None:
+            if len(kv_cache.key_cache) > layer_idx and kv_cache.key_cache[layer_idx] is not None:
+                # 使用缓存的KV并追加新的KV
+                key = torch.cat([kv_cache.key_cache[layer_idx], key], dim=2)
+                value = torch.cat([kv_cache.value_cache[layer_idx], value], dim=2)
+            
+            # 更新缓存
+            if len(kv_cache.key_cache) <= layer_idx:
+                # 扩展缓存列表
+                while len(kv_cache.key_cache) <= layer_idx:
+                    kv_cache.key_cache.append(None)
+                    kv_cache.value_cache.append(None)
+            
+            kv_cache.key_cache[layer_idx] = key
+            kv_cache.value_cache[layer_idx] = value
         
         # 应用旋转位置编码
         if position_ids is not None:
@@ -126,7 +166,8 @@ class TransformerLayer(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = MultiHeadAttention(config)
+        # 使用GQA替代原来的MHA
+        self.self_attn = GroupedQueryAttention(config)
         self.mlp = FeedForward(config)
         self.input_layernorm = RMSNorm(self.hidden_size, eps=config.layer_norm_eps)
         self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=config.layer_norm_eps)
@@ -135,7 +176,9 @@ class TransformerLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None
+        position_ids: Optional[torch.Tensor] = None,
+        kv_cache = None,  # 简化类型注解
+        layer_idx: Optional[int] = None
     ) -> torch.Tensor:
         # 自注意力块
         residual = hidden_states
@@ -143,7 +186,9 @@ class TransformerLayer(nn.Module):
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            position_ids=position_ids
+            position_ids=position_ids,
+            kv_cache=kv_cache,
+            layer_idx=layer_idx
         )
         hidden_states = residual + hidden_states
         
@@ -191,7 +236,9 @@ class TinyLLM(nn.Module):
         self,
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None
+        position_ids: Optional[torch.Tensor] = None,
+        kv_cache = None,  # 简化类型注解
+        use_cache: bool = False
     ) -> torch.Tensor:
         batch_size, seq_length = input_ids.shape
         
@@ -210,11 +257,13 @@ class TinyLLM(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         
         # 通过所有Transformer层
-        for decoder_layer in self.layers:
+        for idx, decoder_layer in enumerate(self.layers):
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
-                position_ids=position_ids
+                position_ids=position_ids,
+                kv_cache=kv_cache if use_cache else None,
+                layer_idx=idx
             )
             
         # 归一化
@@ -242,6 +291,28 @@ class TinyLLM(nn.Module):
             combined_attention_mask = expanded_attn_mask + causal_mask
             
         return combined_attention_mask
+
+class KVCache:
+    """KV缓存管理器"""
+    def __init__(self):
+        self.key_cache: List[torch.Tensor] = []
+        self.value_cache: List[torch.Tensor] = []
+        
+    def update(self, key_states, value_states, layer_idx):
+        """更新指定层的KV缓存"""
+        if len(self.key_cache) <= layer_idx:
+            self.key_cache.append(key_states)
+            self.value_cache.append(value_states)
+        else:
+            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=2)
+            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=2)
+            
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+        
+    def clear(self):
+        """清空缓存"""
+        self.key_cache.clear()
+        self.value_cache.clear()
 
 # 测试代码
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ def demo_train():
     config.hidden_size = 256   # 减小隐藏层维度
     config.num_hidden_layers = 4  # 减少层数
     config.num_attention_heads = 4  # 减少注意力头数
+    config.num_kv_heads = 2  # 减少KV头数以实现GQA
     config.intermediate_size = 512  # 减小前馈网络中间维度
     
     # 初始化模型

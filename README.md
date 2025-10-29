@@ -40,6 +40,8 @@ python inference.py
 - 实现了旋转位置编码(RoPE)
 - 使用RMSNorm归一化
 - 支持Top-K和Top-P采样
+- 支持分组查询注意力(GQA)
+- 支持KV缓存优化推理
 - 模型大小可配置
 
 ## 注意事项
