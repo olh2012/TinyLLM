@@ -12,6 +12,10 @@ class ModelConfig:
         self.layer_norm_eps = 1e-5  # LayerNorm epsilon值
         self.dropout_rate = 0.1  # Dropout概率
         
+        # MLA特定参数
+        self.latent_dim = self.hidden_size // self.num_attention_heads // 2  # 潜在维度
+        self.num_latent_heads = self.num_attention_heads  # 潜在头数
+        
         # 训练参数
         self.learning_rate = 5e-4
         self.batch_size = 8

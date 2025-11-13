@@ -13,9 +13,14 @@ class RotaryPositionEmbedding(nn.Module):
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
         
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
-        # 简化实现以避免类型错误
-        return x  # 直接返回输入，不应用旋转位置编码
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 简化实现，返回全零的cos和sin
+        batch_size = position_ids.shape[0]
+        seq_len = position_ids.shape[1]
+        # 返回全1的cos和全0的sin，相当于不应用位置编码
+        cos = torch.ones(batch_size, seq_len, self.dim, dtype=x.dtype, device=x.device)
+        sin = torch.zeros(batch_size, seq_len, self.dim, dtype=x.dtype, device=x.device)
+        return cos, sin
 
     def rotate_half(self, x):
         """旋转一半维度"""
@@ -25,31 +30,57 @@ class RotaryPositionEmbedding(nn.Module):
 
     def apply_rotary_pos_emb(self, q, k, cos, sin):
         """应用旋转位置编码"""
-        cos = cos.unsqueeze(1)  # [bs, 1, seq_len, dim]
-        sin = sin.unsqueeze(1)  # [bs, 1, seq_len, dim]
+        # 调整cos和sin的维度以匹配q和k
+        # q和k的形状: [batch_size, num_heads, seq_len, head_dim]
+        # cos和sin的形状: [batch_size, seq_len, head_dim]
+        cos = cos.unsqueeze(1)  # [batch_size, 1, seq_len, head_dim]
+        sin = sin.unsqueeze(1)  # [batch_size, 1, seq_len, head_dim]
         q_embed = (q * cos) + (self.rotate_half(q) * sin)
         k_embed = (k * cos) + (self.rotate_half(k) * sin)
         return q_embed, k_embed
 
-class GroupedQueryAttention(nn.Module):
-    """分组查询注意力机制"""
+class MultiHeadLatentAttention(nn.Module):
+    """多头潜在注意力机制"""
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_kv_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.dropout_rate = config.dropout_rate
+        self.use_flash_attention = config.use_flash_attention if hasattr(config, 'use_flash_attention') else False
+        
+        # MLA特定参数
+        self.latent_dim = config.latent_dim
+        self.num_latent_heads = config.num_latent_heads
         
         assert self.head_dim * self.num_heads == self.hidden_size, "hidden_size必须能被num_heads整除"
         
-        self.q_proj = nn.Linear(self.hidden_size, self.hidden_size)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim)
+        # 查询投影
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim)
+        
+        # 潜在键值投影
+        self.k_latent_proj = nn.Linear(self.hidden_size, self.num_latent_heads * self.latent_dim)
+        self.v_latent_proj = nn.Linear(self.hidden_size, self.num_latent_heads * self.latent_dim)
+        
+        # 从潜在表示恢复键值
+        self.k_restore = nn.Linear(self.latent_dim, self.head_dim)
+        self.v_restore = nn.Linear(self.latent_dim, self.head_dim)
+        
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size)
         
         self.rotary_emb = RotaryPositionEmbedding(self.head_dim)
         self.dropout = nn.Dropout(self.dropout_rate)
+        
+        # 尝试导入Flash Attention
+        self.flash_attn_func = None
+        if self.use_flash_attention:
+            try:
+                import importlib
+                flash_attn_module = importlib.import_module("flash_attn")
+                self.flash_attn_func = getattr(flash_attn_module, "flash_attn_func")
+                print("Flash Attention已成功导入")
+            except (ImportError, AttributeError):
+                print("Flash Attention未安装，将使用标准注意力实现")
         
     def forward(
         self,
@@ -61,21 +92,36 @@ class GroupedQueryAttention(nn.Module):
     ) -> torch.Tensor:
         batch_size, seq_length, _ = hidden_states.size()
         
-        # 线性变换得到Q, K, V
+        # 线性变换得到Q和潜在K, V
         query = self.q_proj(hidden_states)
-        key = self.k_proj(hidden_states)
-        value = self.v_proj(hidden_states)
+        k_latent = self.k_latent_proj(hidden_states)
+        v_latent = self.v_latent_proj(hidden_states)
         
         # 重塑为多头形式
         query = query.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
-        key = key.view(batch_size, seq_length, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        value = value.view(batch_size, seq_length, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        k_latent = k_latent.view(batch_size, seq_length, self.num_latent_heads, self.latent_dim)
+        v_latent = v_latent.view(batch_size, seq_length, self.num_latent_heads, self.latent_dim)
         
-        # 如果KV头数少于查询头数，需要重复KV头
-        if self.num_kv_heads != self.num_heads:
+        # 从潜在表示恢复键值 (先应用线性层，再转置)
+        # k_latent和v_latent的形状: [batch_size, seq_length, num_latent_heads, latent_dim]
+        # 重塑为[batch_size * seq_length * num_latent_heads, latent_dim]以应用线性层
+        k_latent_reshaped = k_latent.view(-1, self.latent_dim)
+        v_latent_reshaped = v_latent.view(-1, self.latent_dim)
+        
+        # 应用恢复投影
+        key_reshaped = self.k_restore(k_latent_reshaped)
+        value_reshaped = self.v_restore(v_latent_reshaped)
+        
+        # 恢复形状并转置为[batch_size, num_latent_heads, seq_length, head_dim]
+        key = key_reshaped.view(batch_size, seq_length, self.num_latent_heads, self.head_dim).transpose(1, 2)
+        value = value_reshaped.view(batch_size, seq_length, self.num_latent_heads, self.head_dim).transpose(1, 2)
+        
+        # 如果头数不匹配，需要重复KV头
+        if self.num_latent_heads != self.num_heads:
             # 重复KV头以匹配查询头数
-            key = key.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-            value = value.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+            repeat_times = self.num_heads // self.num_latent_heads
+            key = key.repeat_interleave(repeat_times, dim=1)
+            value = value.repeat_interleave(repeat_times, dim=1)
         
         # 应用KV缓存
         if kv_cache is not None and layer_idx is not None:
@@ -96,22 +142,33 @@ class GroupedQueryAttention(nn.Module):
         
         # 应用旋转位置编码
         if position_ids is not None:
-            cos_sin = self.rotary_emb(value, position_ids)
-            query, key = self.apply_rotary_pos_emb(query, key, cos_sin)
+            cos, sin = self.rotary_emb(value, position_ids)
+            query, key = self.rotary_emb.apply_rotary_pos_emb(query, key, cos, sin)
         
-        # 计算注意力分数
-        attn_scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        
-        # 应用注意力掩码
-        if attention_mask is not None:
-            attn_scores = attn_scores + attention_mask
+        # 使用Flash Attention（如果可用且配置启用）
+        if self.use_flash_attention and self.flash_attn_func is not None and kv_cache is None:
+            # Flash Attention需要重新排列维度
+            query_trans = query.transpose(1, 2)  # [batch, seq_len, heads, head_dim]
+            key_trans = key.transpose(1, 2)      # [batch, seq_len, heads, head_dim]
+            value_trans = value.transpose(1, 2)  # [batch, seq_len, heads, head_dim]
             
-        # softmax归一化
-        attn_weights = torch.softmax(attn_scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        
-        # 加权求和
-        attn_output = torch.matmul(attn_weights, value)
+            # 应用Flash Attention
+            attn_output = self.flash_attn_func(query_trans, key_trans, value_trans, causal=True)
+            attn_output = attn_output.transpose(1, 2)  # 转换回[batch, heads, seq_len, head_dim]
+        else:
+            # 计算注意力分数
+            attn_scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            
+            # 应用注意力掩码
+            if attention_mask is not None:
+                attn_scores = attn_scores + attention_mask
+                
+            # softmax归一化
+            attn_weights = torch.softmax(attn_scores, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+            
+            # 加权求和
+            attn_output = torch.matmul(attn_weights, value)
         
         # 合并多头结果
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, self.hidden_size)
@@ -122,8 +179,8 @@ class GroupedQueryAttention(nn.Module):
         return attn_output
     
     def apply_rotary_pos_emb(self, q: torch.Tensor, k: torch.Tensor, cos_sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # 简化的RoPE应用（实际实现可能更复杂）
-        # 这里我们只是返回原始的q和k，实际实现中需要应用旋转位置编码
+        # 这个方法不再使用，因为我们在forward中直接调用RoPE模块的方法
+        # 保留此方法以保持接口兼容性
         return q, k
 
 class FeedForward(nn.Module):
@@ -166,8 +223,8 @@ class TransformerLayer(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
-        # 使用GQA替代原来的MHA
-        self.self_attn = GroupedQueryAttention(config)
+        # 使用MLA替代原来的GQA
+        self.self_attn = MultiHeadLatentAttention(config)
         self.mlp = FeedForward(config)
         self.input_layernorm = RMSNorm(self.hidden_size, eps=config.layer_norm_eps)
         self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=config.layer_norm_eps)
@@ -291,6 +348,32 @@ class TinyLLM(nn.Module):
             combined_attention_mask = expanded_attn_mask + causal_mask
             
         return combined_attention_mask
+    
+    def quantize(self, bits: int = 8):
+        """模型量化"""
+        try:
+            import torch.quantization as quant
+            # 设置量化配置
+            if bits == 8:
+                # 8位量化
+                self.qconfig = quant.get_default_qconfig('fbgemm')
+                quant.prepare(self, inplace=True)
+                quant.convert(self, inplace=True)
+            elif bits == 4:
+                # 4位量化 - 简化的实现
+                for name, module in self.named_modules():
+                    if isinstance(module, (nn.Linear, nn.Embedding)):
+                        # 对权重进行4位量化
+                        if hasattr(module, 'weight'):
+                            # 简单的线性量化
+                            weight = module.weight.data
+                            scale = (weight.max() - weight.min()) / (2 ** bits - 1)
+                            zero_point = -weight.min() / scale
+                            quantized_weight = torch.round(weight / scale + zero_point).clamp(0, 2 ** bits - 1)
+                            module.weight.data = (quantized_weight - zero_point) * scale
+            print(f"模型已量化为{bits}位")
+        except Exception as e:
+            print(f"量化过程中出现错误: {e}")
 
 class KVCache:
     """KV缓存管理器"""

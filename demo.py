@@ -22,6 +22,10 @@ def demo_train():
     config.num_kv_heads = 2  # 减少KV头数以实现GQA
     config.intermediate_size = 512  # 减小前馈网络中间维度
     
+    # 重新计算MLA参数以匹配新的hidden_size和num_attention_heads
+    config.latent_dim = config.hidden_size // config.num_attention_heads // 2
+    config.num_latent_heads = config.num_attention_heads
+    
     # 初始化模型
     model = TinyLLM(config)
     model.to(device)
