@@ -1,0 +1,39 @@
+{
+  "model": {
+    "d_model": 768,
+    "num_layers": 12,
+    "num_heads": 12,
+    "d_ff": 3072,
+    "max_seq_len": 512,
+    "dropout": 0.1,
+    "use_rope": false
+  },
+  "tokenizer": {
+    "vocab_path": "./tokenizer_output/vocab.json",
+    "merges_path": "./tokenizer_output/merges.txt"
+  },
+  "data": {
+    "type": "txt",
+    "train_path": "./data/train.txt",
+    "val_path": "./data/val.txt",
+    "text_key": "text",
+    "max_samples": null
+  },
+  "training": {
+    "batch_size": 4,
+    "gradient_accumulation_steps": 8,
+    "num_epochs": 10,
+    "learning_rate": 6e-4,
+    "optimizer": "adamw",
+    "betas": [0.9, 0.999],
+    "weight_decay": 0.01,
+    "max_grad_norm": 1.0,
+    "scheduler": "cosine",
+    "num_workers": 0,
+    "log_interval": 100
+  },
+  "output": {
+    "checkpoint_dir": "./checkpoints",
+    "log_dir": "./logs"
+  }
+}
