@@ -307,28 +307,180 @@ This is the second training sample.
 ## 🚧 下一步扩展方向
 
 ### 性能优化
+- [x] Gradient Checkpointing（节省显存）
+- [x] Mixed Precision Training（FP16/BF16）
+- [x] 分布式训练（DDP）
 - [ ] Flash Attention（减少内存占用）
-- [ ] Gradient Checkpointing（节省显存）
-- [ ] Mixed Precision Training（FP16/BF16）
-- [ ] 分布式训练（DDP/DeepSpeed）
+- [ ] DeepSpeed集成
 
 ### 模型改进
-- [ ] LoRA/QLoRA（参数高效微调）
+- [x] LoRA/QLoRA（参数高效微调）
+- [x] 激活函数优化（Swish, GLU等）
+- [x] 归一化方法（RMSNorm等）
 - [ ] 更好的位置编码（ALiBi等）
-- [ ] 激活函数优化（Swish, GLU等）
-- [ ] 归一化方法（RMSNorm等）
 
 ### 功能增强
 - [ ] 支持多轮对话
 - [ ] 支持指令微调（Instruction Tuning）
 - [ ] 支持RLHF（Reinforcement Learning from Human Feedback）
-- [ ] 模型量化（INT8/INT4）
+- [x] 模型量化（INT8）
 
 ### 工程优化
+- [x] 推理服务化（FastAPI）
 - [ ] 模型导出（ONNX/TensorRT）
-- [ ] 推理服务化（FastAPI/Flask）
 - [ ] 模型压缩（Pruning/Distillation）
 - [ ] 更完善的日志和监控
+
+## ✨ 新增功能
+
+### 1. 混合精度训练（FP16/BF16）
+
+在配置文件中启用混合精度训练：
+
+```json
+{
+  "training": {
+    "use_amp": true,
+    "amp_dtype": "fp16"  // 或 "bf16"
+  }
+}
+```
+
+**优势**：
+- 减少显存占用（约50%）
+- 加速训练（约1.5-2倍）
+- BF16在支持的硬件上更稳定
+
+### 2. Gradient Checkpointing
+
+在配置文件中启用：
+
+```json
+{
+  "model": {
+    "gradient_checkpointing": true
+  }
+}
+```
+
+**优势**：
+- 显著减少显存占用（约50-70%）
+- 允许训练更大的模型或使用更大的batch size
+- 训练速度略有下降（约20%）
+
+### 3. 更多激活函数
+
+支持GELU、ReLU、Swish、GLU：
+
+```json
+{
+  "model": {
+    "mlp_activation": "swish"  // gelu, relu, swish, glu
+  }
+}
+```
+
+### 4. RMSNorm归一化
+
+使用RMSNorm替代LayerNorm：
+
+```json
+{
+  "model": {
+    "norm_type": "rmsnorm"  // layernorm 或 rmsnorm
+  }
+}
+```
+
+**优势**：
+- 计算更高效
+- 在某些任务上表现更好
+
+### 5. LoRA参数高效微调
+
+使用LoRA进行微调，只需训练少量参数：
+
+```bash
+python train/train_lora.py \
+    --config configs/gpt_small.json \
+    --base_model checkpoints/checkpoint_best.pt \
+    --lora_rank 8 \
+    --lora_alpha 16.0 \
+    --target_modules attention mlp
+```
+
+**优势**：
+- 只需训练0.1-1%的参数
+- 显存占用大幅减少
+- 训练速度快
+- 可以保存多个任务特定的LoRA权重
+
+### 6. 分布式训练（DDP）
+
+使用torchrun启动多GPU训练：
+
+```bash
+torchrun --nproc_per_node=4 train/train.py \
+    --config configs/gpt_small.json
+```
+
+**优势**：
+- 线性加速训练
+- 支持多机多卡训练
+
+### 7. 模型量化（INT8）
+
+量化模型以减少推理时的显存占用：
+
+```bash
+python inference/quantize.py \
+    --checkpoint checkpoints/checkpoint_best.pt \
+    --config configs/gpt_small.json \
+    --output checkpoints/quantized_model.pt
+```
+
+**优势**：
+- 模型大小减少约75%
+- 推理速度提升
+- 显存占用减少
+
+### 8. 推理服务化（FastAPI）
+
+启动API服务：
+
+```bash
+export CHECKPOINT_PATH=./checkpoints/checkpoint_best.pt
+export CONFIG_PATH=./configs/gpt_small.json
+export VOCAB_PATH=./tokenizer_output/vocab.json
+export MERGES_PATH=./tokenizer_output/merges.txt
+
+python inference/api_server.py
+```
+
+或使用uvicorn：
+
+```bash
+uvicorn inference.api_server:app --host 0.0.0.0 --port 8000
+```
+
+**API端点**：
+- `GET /`: API信息
+- `GET /health`: 健康检查
+- `POST /generate`: 单次生成
+- `POST /generate/batch`: 批量生成
+
+**示例请求**：
+```bash
+curl -X POST "http://localhost:8000/generate" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "prompt": "The future of AI",
+       "max_length": 100,
+       "temperature": 0.8,
+       "top_k": 50,
+       "top_p": 0.9
+     }'
+```
 
 ## 📚 参考资源
 

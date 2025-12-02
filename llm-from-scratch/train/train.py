@@ -12,6 +12,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import autocast, GradScaler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
 import sys
 
 # 添加项目根目录到路径
@@ -29,7 +33,7 @@ def load_config(config_path: str):
     return config
 
 
-def create_dataloader(config, tokenizer, split='train'):
+def create_dataloader(config, tokenizer, split='train', use_ddp=False, rank=0, world_size=1):
     """创建数据加载器"""
     data_config = config['data']
     data_type = data_config['type']
@@ -61,10 +65,20 @@ def create_dataloader(config, tokenizer, split='train'):
     else:
         raise ValueError(f"不支持的数据类型: {data_type}")
     
+    # 分布式训练时使用DistributedSampler
+    sampler = None
+    shuffle = None
+    if use_ddp and split == 'train':
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        shuffle = False
+    else:
+        shuffle = (split == 'train')
+    
     dataloader = DataLoader(
         dataset,
         batch_size=config['training']['batch_size'],
-        shuffle=(split == 'train'),
+        shuffle=shuffle,
+        sampler=sampler,
         num_workers=config['training'].get('num_workers', 0),
         pin_memory=True
     )
@@ -72,7 +86,7 @@ def create_dataloader(config, tokenizer, split='train'):
     return dataloader
 
 
-def save_checkpoint(model, optimizer, epoch, step, loss, checkpoint_dir, is_best=False):
+def save_checkpoint(model, optimizer, epoch, step, loss, checkpoint_dir, is_best=False, scaler=None):
     """保存checkpoint"""
     os.makedirs(checkpoint_dir, exist_ok=True)
     
@@ -83,6 +97,10 @@ def save_checkpoint(model, optimizer, epoch, step, loss, checkpoint_dir, is_best
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
     }
+    
+    # 保存scaler状态（如果使用混合精度）
+    if scaler is not None:
+        checkpoint['scaler_state_dict'] = scaler.state_dict()
     
     # 保存最新checkpoint
     checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint_latest.pt')
@@ -110,7 +128,7 @@ def load_checkpoint(model, optimizer, checkpoint_path, device):
     return epoch, step, loss
 
 
-def train_epoch(model, dataloader, optimizer, device, config, epoch, writer, global_step):
+def train_epoch(model, dataloader, optimizer, device, config, epoch, writer, global_step, scaler=None, use_amp=False, amp_dtype='fp16', rank=0):
     """训练一个epoch"""
     model.train()
     total_loss = 0.0
@@ -120,62 +138,115 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, writer, glo
     gradient_accumulation_steps = training_config.get('gradient_accumulation_steps', 1)
     max_grad_norm = training_config.get('max_grad_norm', 1.0)
     
+    # 设置autocast dtype
+    dtype = torch.bfloat16 if amp_dtype == 'bf16' else torch.float16
+    
     optimizer.zero_grad()
     
     for batch_idx, batch in enumerate(dataloader):
         input_ids = batch['input_ids'].to(device)
         labels = batch['labels'].to(device)
         
-        # Forward pass
-        outputs = model(input_ids=input_ids, labels=labels)
-        loss = outputs['loss'] / gradient_accumulation_steps
-        
-        # Backward pass
-        loss.backward()
+        # Forward pass with mixed precision
+        if use_amp:
+            with autocast(dtype=dtype):
+                outputs = model(input_ids=input_ids, labels=labels)
+                loss = outputs['loss'] / gradient_accumulation_steps
+            
+            # Backward pass with gradient scaling (only for FP16)
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+        else:
+            outputs = model(input_ids=input_ids, labels=labels)
+            loss = outputs['loss'] / gradient_accumulation_steps
+            loss.backward()
         
         # Gradient accumulation
         if (batch_idx + 1) % gradient_accumulation_steps == 0:
             # Gradient clipping
             if max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                if use_amp and scaler is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    optimizer.step()
+            else:
+                if use_amp and scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
             
-            optimizer.step()
             optimizer.zero_grad()
         
         total_loss += loss.item() * gradient_accumulation_steps
         num_batches += 1
         global_step += 1
         
-        # 记录日志
+        # 记录日志（只在rank 0记录）
         if global_step % training_config.get('log_interval', 100) == 0:
             avg_loss = total_loss / num_batches
-            print(f"Epoch {epoch}, Step {global_step}, Loss: {avg_loss:.4f}")
-            writer.add_scalar('train/loss', avg_loss, global_step)
-            writer.add_scalar('train/learning_rate', optimizer.param_groups[0]['lr'], global_step)
+            if rank == 0:
+                print(f"Epoch {epoch}, Step {global_step}, Loss: {avg_loss:.4f}")
+                if writer:
+                    writer.add_scalar('train/loss', avg_loss, global_step)
+                    writer.add_scalar('train/learning_rate', optimizer.param_groups[0]['lr'], global_step)
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     return avg_loss, global_step
 
 
-def validate(model, dataloader, device):
+def validate(model, dataloader, device, use_amp=False, amp_dtype='fp16'):
     """验证"""
     model.eval()
     total_loss = 0.0
     num_batches = 0
+    
+    dtype = torch.bfloat16 if amp_dtype == 'bf16' else torch.float16
     
     with torch.no_grad():
         for batch in dataloader:
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
             
-            outputs = model(input_ids=input_ids, labels=labels)
-            loss = outputs['loss']
+            if use_amp:
+                with autocast(dtype=dtype):
+                    outputs = model(input_ids=input_ids, labels=labels)
+                    loss = outputs['loss']
+            else:
+                outputs = model(input_ids=input_ids, labels=labels)
+                loss = outputs['loss']
             
             total_loss += loss.item()
             num_batches += 1
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     return avg_loss
+
+
+def setup_distributed():
+    """初始化分布式训练"""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        
+        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+        torch.cuda.set_device(local_rank)
+        
+        return True, rank, world_size, local_rank
+    return False, 0, 1, 0
+
+
+def cleanup_distributed():
+    """清理分布式训练"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def main():
@@ -186,18 +257,33 @@ def main():
                         help='恢复训练的checkpoint路径')
     parser.add_argument('--device', type=str, default=None,
                         help='设备 (cuda/cpu)')
+    parser.add_argument('--local_rank', type=int, default=-1,
+                        help='本地GPU rank（用于分布式训练）')
     
     args = parser.parse_args()
+    
+    # 分布式训练设置
+    use_ddp, rank, world_size, local_rank = setup_distributed()
+    
+    if use_ddp:
+        print(f"分布式训练: rank={rank}, world_size={world_size}, local_rank={local_rank}")
+    elif args.local_rank >= 0:
+        # 单机多卡但未使用torchrun
+        print("警告: 检测到local_rank但未使用分布式训练，请使用torchrun启动")
     
     # 加载配置
     config = load_config(args.config)
     
     # 设备
-    if args.device:
+    if use_ddp:
+        device = torch.device(f'cuda:{local_rank}')
+    elif args.device:
         device = torch.device(args.device)
     else:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"使用设备: {device}")
+    
+    if rank == 0:
+        print(f"使用设备: {device}")
     
     # 创建输出目录
     output_dir = config['output']['checkpoint_dir']
@@ -205,38 +291,52 @@ def main():
     log_dir = config['output'].get('log_dir', os.path.join(output_dir, 'logs'))
     os.makedirs(log_dir, exist_ok=True)
     
-    # TensorBoard writer
-    writer = SummaryWriter(log_dir)
+    # TensorBoard writer（只在rank 0创建）
+    writer = None
+    if rank == 0:
+        writer = SummaryWriter(log_dir)
     
     # 加载tokenizer
-    print("加载tokenizer...")
+    if rank == 0:
+        print("加载tokenizer...")
     tokenizer = BPETokenizer()
     tokenizer.load(
         config['tokenizer']['vocab_path'],
         config['tokenizer']['merges_path']
     )
     vocab_size = tokenizer.get_vocab_size()
-    print(f"词汇表大小: {vocab_size}")
+    if rank == 0:
+        print(f"词汇表大小: {vocab_size}")
     
     # 创建模型
-    print("创建模型...")
+    if rank == 0:
+        print("创建模型...")
     model_config = config['model'].copy()
     model_config['vocab_size'] = vocab_size
     model = GPTModel.from_config(model_config)
     model = model.to(device)
     
-    num_params = model.get_num_params()
-    print(f"模型参数量: {num_params:,} ({num_params / 1e6:.2f}M)")
+    # 分布式训练时包装模型
+    if use_ddp:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        num_params = model.module.get_num_params() if hasattr(model, 'module') else model.get_num_params()
+    else:
+        num_params = model.get_num_params()
+    
+    if rank == 0:
+        print(f"模型参数量: {num_params:,} ({num_params / 1e6:.2f}M)")
     
     # 创建数据加载器
-    print("创建数据加载器...")
-    train_loader = create_dataloader(config, tokenizer, split='train')
+    if rank == 0:
+        print("创建数据加载器...")
+    train_loader = create_dataloader(config, tokenizer, split='train', use_ddp=use_ddp, rank=rank, world_size=world_size)
     val_loader = None
     if config['data'].get('val_path') or config['data'].get('type') == 'huggingface':
         try:
-            val_loader = create_dataloader(config, tokenizer, split='val')
+            val_loader = create_dataloader(config, tokenizer, split='val', use_ddp=use_ddp, rank=rank, world_size=world_size)
         except:
-            print("警告：无法创建验证集，跳过验证")
+            if rank == 0:
+                print("警告：无法创建验证集，跳过验证")
     
     # 优化器
     training_config = config['training']
@@ -273,6 +373,24 @@ def main():
                 total_iters=training_config['num_epochs']
             )
     
+    # 混合精度训练设置
+    use_amp = training_config.get('use_amp', False)
+    amp_dtype = training_config.get('amp_dtype', 'fp16')  # 'fp16' or 'bf16'
+    scaler = None
+    
+    if use_amp:
+        if amp_dtype == 'bf16':
+            # BF16不需要scaler
+            use_amp = torch.cuda.is_bf16_supported()
+            if not use_amp:
+                print("警告: 当前设备不支持BF16，将使用FP32训练")
+                use_amp = False
+        else:
+            # FP16需要scaler
+            scaler = GradScaler()
+        if use_amp:
+            print(f"启用混合精度训练: {amp_dtype.upper()}")
+    
     # 恢复训练
     start_epoch = 0
     global_step = 0
@@ -281,28 +399,42 @@ def main():
     if args.resume:
         print(f"从 {args.resume} 恢复训练...")
         start_epoch, global_step, _ = load_checkpoint(model, optimizer, args.resume, device)
+        if scaler is not None:
+            # 如果使用scaler，尝试从checkpoint加载
+            checkpoint = torch.load(args.resume, map_location=device)
+            if 'scaler_state_dict' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
         print(f"从epoch {start_epoch}, step {global_step} 继续训练")
     
     # 训练循环
     num_epochs = training_config['num_epochs']
-    print(f"\n开始训练，共 {num_epochs} 个epoch...")
+    if rank == 0:
+        print(f"\n开始训练，共 {num_epochs} 个epoch...")
     
     for epoch in range(start_epoch, num_epochs):
-        print(f"\n{'='*50}")
-        print(f"Epoch {epoch + 1}/{num_epochs}")
-        print(f"{'='*50}")
+        if use_ddp:
+            train_loader.sampler.set_epoch(epoch)
+        
+        if rank == 0:
+            print(f"\n{'='*50}")
+            print(f"Epoch {epoch + 1}/{num_epochs}")
+            print(f"{'='*50}")
         
         # 训练
         train_loss, global_step = train_epoch(
-            model, train_loader, optimizer, device, config, epoch, writer, global_step
+            model, train_loader, optimizer, device, config, epoch, writer, global_step,
+            scaler=scaler, use_amp=use_amp, amp_dtype=amp_dtype, rank=rank
         )
-        print(f"训练损失: {train_loss:.4f}")
+        if rank == 0:
+            print(f"训练损失: {train_loss:.4f}")
         
         # 验证
         if val_loader:
-            val_loss = validate(model, val_loader, device)
-            print(f"验证损失: {val_loss:.4f}")
-            writer.add_scalar('val/loss', val_loss, epoch)
+            val_loss = validate(model, val_loader, device, use_amp=use_amp, amp_dtype=amp_dtype)
+            if rank == 0:
+                print(f"验证损失: {val_loss:.4f}")
+                if writer:
+                    writer.add_scalar('val/loss', val_loss, epoch)
             
             # 保存最佳模型
             is_best = val_loss < best_val_loss
@@ -311,18 +443,26 @@ def main():
         else:
             is_best = False
         
-        # 保存checkpoint
-        save_checkpoint(
-            model, optimizer, epoch, global_step, train_loss,
-            output_dir, is_best=is_best
-        )
+        # 保存checkpoint（只在rank 0保存）
+        if rank == 0:
+            # 获取模型状态（如果是DDP）
+            model_to_save = model.module if use_ddp else model
+            save_checkpoint(
+                model_to_save, optimizer, epoch, global_step, train_loss,
+                output_dir, is_best=is_best, scaler=scaler
+            )
         
         # 更新学习率
         if scheduler:
             scheduler.step()
     
-    print("\n训练完成！")
-    writer.close()
+    if rank == 0:
+        print("\n训练完成！")
+        writer.close()
+    
+    # 清理分布式训练
+    if use_ddp:
+        cleanup_distributed()
 
 
 if __name__ == '__main__':
