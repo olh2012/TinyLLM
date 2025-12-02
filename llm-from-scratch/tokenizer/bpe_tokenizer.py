@@ -157,7 +157,7 @@ class BPETokenizer:
         # 对每个词应用BPE
         tokens = []
         if add_special_tokens:
-            tokens.append(self.bos_token)
+            tokens.append(self.vocab[self.bos_token])
         
         for word in words:
             bpe_tokens = self._apply_bpe(word)
@@ -168,7 +168,7 @@ class BPETokenizer:
                     tokens.append(self.vocab[self.unk_token])
         
         if add_special_tokens:
-            tokens.append(self.eos_token)
+            tokens.append(self.vocab[self.eos_token])
         
         return tokens
     
