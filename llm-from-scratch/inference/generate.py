@@ -88,14 +88,14 @@ def generate_text(model, tokenizer, prompt, max_length=100, temperature=1.0,
             )
             
             # 检查是否到达EOS
-            if next_token.item() == tokenizer.vocab[tokenizer.eos_token]:
+            if next_token[0, 0].item() == tokenizer.vocab[tokenizer.eos_token]:
                 break
             
             # 添加到生成序列
-            generated = torch.cat([generated, next_token.unsqueeze(0)], dim=1)
+            generated = torch.cat([generated, next_token], dim=1)
             
             # 更新input_ids为最后一个token（用于下一次迭代）
-            input_ids = next_token.unsqueeze(0)
+            input_ids = next_token
     
     # 解码生成的文本
     generated_ids = generated[0].cpu().tolist()
