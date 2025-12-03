@@ -9,15 +9,18 @@ import math
 from .attention import MultiHeadAttention
 from .mlp import MLP
 from .embedding import PositionalEmbedding
+from .normalization import RMSNorm
 
 
 class TransformerBlock(nn.Module):
     """Transformer Block (Decoder Layer)"""
     
     def __init__(self, d_model: int, num_heads: int, d_ff: int, 
-                 dropout: float = 0.1, use_rope: bool = False):
+                 dropout: float = 0.1, use_rope: bool = False, 
+                 gradient_checkpointing: bool = False, norm_type: str = 'layernorm'):
         super().__init__()
         self.use_rope = use_rope
+        self.gradient_checkpointing = gradient_checkpointing
         
         # 注意力层
         self.attention = MultiHeadAttention(d_model, num_heads, dropout)
@@ -25,9 +28,13 @@ class TransformerBlock(nn.Module):
         # 前馈网络
         self.mlp = MLP(d_model, d_ff, dropout)
         
-        # Layer Normalization
-        self.ln1 = nn.LayerNorm(d_model)
-        self.ln2 = nn.LayerNorm(d_model)
+        # Normalization
+        if norm_type == 'rmsnorm':
+            self.ln1 = RMSNorm(d_model)
+            self.ln2 = RMSNorm(d_model)
+        else:
+            self.ln1 = nn.LayerNorm(d_model)
+            self.ln2 = nn.LayerNorm(d_model)
         
         self.dropout = nn.Dropout(dropout)
         
@@ -35,6 +42,26 @@ class TransformerBlock(nn.Module):
         if use_rope:
             from .embedding import RotaryPositionalEmbedding
             self.rope = RotaryPositionalEmbedding(d_model)
+    
+    def _forward_attention(self, x, mask=None, kv_cache=None):
+        """注意力前向传播（用于gradient checkpointing）"""
+        residual = x
+        x = self.ln1(x)
+        
+        if self.use_rope:
+            x = self.rope(x)
+        
+        attn_output, new_kv_cache = self.attention(x, x, x, mask=mask, kv_cache=kv_cache)
+        x = residual + self.dropout(attn_output)
+        return x, new_kv_cache
+    
+    def _forward_mlp(self, x):
+        """MLP前向传播（用于gradient checkpointing）"""
+        residual = x
+        x = self.ln2(x)
+        mlp_output = self.mlp(x)
+        x = residual + self.dropout(mlp_output)
+        return x
     
     def forward(self, x, mask=None, kv_cache=None):
         """
@@ -46,24 +73,32 @@ class TransformerBlock(nn.Module):
             output: [batch_size, seq_len, d_model]
             new_kv_cache: updated KV cache
         """
-        # Self-attention with residual connection
-        residual = x
-        x = self.ln1(x)
-        
-        # 如果使用RoPE，在attention之前应用
-        if self.use_rope:
-            x = self.rope(x)
-        
-        attn_output, new_kv_cache = self.attention(x, x, x, mask=mask, kv_cache=kv_cache)
-        x = residual + self.dropout(attn_output)
-        
-        # MLP with residual connection
-        residual = x
-        x = self.ln2(x)
-        mlp_output = self.mlp(x)
-        x = residual + self.dropout(mlp_output)
-        
-        return x, new_kv_cache
+        # 推理时或未启用gradient checkpointing时，使用正常前向传播
+        if not self.training or not self.gradient_checkpointing or kv_cache is not None:
+            # Self-attention with residual connection
+            residual = x
+            x = self.ln1(x)
+            
+            # 如果使用RoPE，在attention之前应用
+            if self.use_rope:
+                x = self.rope(x)
+            
+            attn_output, new_kv_cache = self.attention(x, x, x, mask=mask, kv_cache=kv_cache)
+            x = residual + self.dropout(attn_output)
+            
+            # MLP with residual connection
+            residual = x
+            x = self.ln2(x)
+            mlp_output = self.mlp(x)
+            x = residual + self.dropout(mlp_output)
+            
+            return x, new_kv_cache
+        else:
+            # 训练时使用gradient checkpointing
+            from torch.utils.checkpoint import checkpoint
+            x, new_kv_cache = checkpoint(self._forward_attention, x, mask, use_reentrant=False)
+            x = checkpoint(self._forward_mlp, x, use_reentrant=False)
+            return x, new_kv_cache
 
 
 class GPTModel(nn.Module):
@@ -71,13 +106,16 @@ class GPTModel(nn.Module):
     
     def __init__(self, vocab_size: int, d_model: int = 768, num_layers: int = 12,
                  num_heads: int = 12, d_ff: int = 3072, max_seq_len: int = 512,
-                 dropout: float = 0.1, use_rope: bool = False):
+                 dropout: float = 0.1, use_rope: bool = False, 
+                 gradient_checkpointing: bool = False, norm_type: str = 'layernorm'):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.num_layers = num_layers
         self.max_seq_len = max_seq_len
         self.use_rope = use_rope
+        self.gradient_checkpointing = gradient_checkpointing
+        self.norm_type = norm_type
         
         # Token embedding
         self.token_embedding = nn.Embedding(vocab_size, d_model)
@@ -90,12 +128,15 @@ class GPTModel(nn.Module):
         
         # Transformer blocks
         self.blocks = nn.ModuleList([
-            TransformerBlock(d_model, num_heads, d_ff, dropout, use_rope)
+            TransformerBlock(d_model, num_heads, d_ff, dropout, use_rope, gradient_checkpointing, norm_type)
             for _ in range(num_layers)
         ])
         
         # Final layer norm
-        self.ln_f = nn.LayerNorm(d_model)
+        if norm_type == 'rmsnorm':
+            self.ln_f = RMSNorm(d_model)
+        else:
+            self.ln_f = nn.LayerNorm(d_model)
         
         # Output head
         self.head = nn.Linear(d_model, vocab_size, bias=False)
@@ -186,5 +227,7 @@ class GPTModel(nn.Module):
             d_ff=config['d_ff'],
             max_seq_len=config['max_seq_len'],
             dropout=config.get('dropout', 0.1),
-            use_rope=config.get('use_rope', False)
+            use_rope=config.get('use_rope', False),
+            gradient_checkpointing=config.get('gradient_checkpointing', False),
+            norm_type=config.get('norm_type', 'layernorm')
         )
